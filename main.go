@@ -137,8 +137,6 @@ func maintainCerts(client *vault.Client, path string, dir string) error {
 			half = (time.Duration(secret.LeaseDuration) * time.Second) / 2
 		}
 	}
-
-	return nil
 }
 
 func getAndWriteCerts(client *vault.Client, path string, dir string) (*vault.Secret, error) {
