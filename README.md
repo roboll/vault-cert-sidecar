@@ -1,1 +1,1 @@
-# kubelet-vault-registrar
+# vault-cert-sidecar
