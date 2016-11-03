@@ -236,12 +236,17 @@ func getAndWriteCerts(client *vault.Client, path string, dir string, hostname, i
 	log.Printf("got secret with ttl %s.", time.Duration(secret.LeaseDuration)*time.Second)
 
 	cert := secret.Data["certificate"].(string)
-	if err := ioutil.WriteFile(fmt.Sprintf("%s/cert.pem", dir), []byte(cert), 0600); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(dir, "cert.pem"), []byte(cert), 0600); err != nil {
 		return nil, err
 	}
 
 	key := secret.Data["private_key"].(string)
-	if err := ioutil.WriteFile(fmt.Sprintf("%s/key.pem", dir), []byte(key), 0600); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(dir, "key.pem"), []byte(key), 0600); err != nil {
+		return nil, err
+	}
+
+	ca := secret.Data["ca_chain"].(string)
+	if err := ioutil.WriteFile(filepath.Join(dir, "ca.pem"), []byte(ca), 0600); err != nil {
 		return nil, err
 	}
 	return secret, nil
