@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -21,9 +22,10 @@ var (
 
 	pkibackend = flag.String("pki-backend", "", "Vault PKI backend path.")
 	pkirole    = flag.String("pki-role", "kubelet", "Vault PKI role.")
-	certdir    = flag.String("cert-dir", "/var/lib/kubelet/certs", "Certificate storage dir.")
 
-	apiserver = flag.String("apiserver", "", "Kubernetes apiserver url.")
+	target     = flag.String("target", "/var/lib/kubelet/certs", "Asset storage directory.")
+	writeToken = flag.Bool("write-token", false, "Write token to target directory.")
+	writeNonce = flag.Bool("write-nonce", true, "Write nonce to target directory (only applicable for aws-ec2 auth).")
 )
 
 type VaultAuthStrategy string
@@ -42,17 +44,17 @@ func main() {
 		panic(err.Error())
 	}
 
-	if err := authenticate(vclient, VaultAuthStrategy(*vauth)); err != nil {
+	if err := authenticate(vclient, VaultAuthStrategy(*vauth), *target, *writeToken, *writeNonce); err != nil {
 		panic(err.Error())
 	}
 
-	if err := os.MkdirAll(*certdir, 0777); err != nil {
+	if err := os.MkdirAll(*target, 0777); err != nil {
 		panic(err.Error())
 	}
 
 	go func() {
 		path := fmt.Sprintf("%s/issue/%s", *pkibackend, *pkirole)
-		err := maintainCerts(vclient, path, *certdir)
+		err := maintainCerts(vclient, path, *target)
 		if err != nil {
 			log.Fatal(err.Error())
 		}
@@ -73,7 +75,7 @@ func newVaultClient(flag string) (*vault.Client, error) {
 	return vault.NewClient(vconfig)
 }
 
-func authenticate(client *vault.Client, strategy VaultAuthStrategy) error {
+func authenticate(client *vault.Client, strategy VaultAuthStrategy, target string, writeToken, writeNonce bool) error {
 	switch strategy {
 	case AuthToken:
 		if client.Token() == "" {
@@ -90,13 +92,33 @@ func authenticate(client *vault.Client, strategy VaultAuthStrategy) error {
 			"role":  os.Getenv("VAULT_AUTH_ROLE"),
 			"pkcs7": pkcs,
 		}
+		if writeNonce {
+			nonce, err := ioutil.ReadFile(path.Join(target, "nonce"))
+			if err != nil {
+				log.Printf("couldn't read nonce: %s", err.Error())
+			} else {
+				payload["nonce"] = string(nonce)
+			}
+		}
 		resp, err := client.Logical().Write("auth/aws-ec2/login", payload)
 		if err != nil {
 			return err
 		}
 
-		//meta["nonce"] = resp.Auth.Metadata["nonce"]
+		if writeNonce {
+			err := ioutil.WriteFile(path.Join(target, "nonce"), []byte(resp.Auth.Metadata["nonce"]), 0600)
+			if err != nil {
+				return err
+			}
+		}
+
 		client.SetToken(resp.Auth.ClientToken)
+		if writeToken {
+			err := ioutil.WriteFile(path.Join(target, "file"), []byte(resp.Auth.ClientToken), 0600)
+			if err != nil {
+				return err
+			}
+		}
 		go func() {
 			half := (time.Duration(resp.Auth.LeaseDuration) * time.Second) / 2
 			for {
