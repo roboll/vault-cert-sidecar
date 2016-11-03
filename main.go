@@ -9,7 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,9 +23,12 @@ var (
 	pkibackend = flag.String("pki-backend", "", "Vault PKI backend path.")
 	pkirole    = flag.String("pki-role", "kubelet", "Vault PKI role.")
 
-	target     = flag.String("target", "/var/lib/kubelet/certs", "Asset storage directory.")
-	writeToken = flag.Bool("write-token", false, "Write token to target directory.")
-	writeNonce = flag.Bool("write-nonce", true, "Write nonce to target directory (only applicable for aws-ec2 auth).")
+	certdir   = flag.String("cert-dir", "", "Certificate storage directory.")
+	hostname  = flag.String("hostname", "", "Hostname - empty triggers hostname discovery.")
+	ipsan     = flag.String("ip-san", "", "IP SAN - empty triggers ip discovery.")
+	localhost = flag.Bool("localhost", false, "Include localhost in IP SANs.")
+
+	authdir = flag.String("auth-dir", "", "Auth info (token, nonce) storage directory.")
 )
 
 type VaultAuthStrategy string
@@ -44,17 +47,56 @@ func main() {
 		panic(err.Error())
 	}
 
-	if err := authenticate(vclient, VaultAuthStrategy(*vauth), *target, *writeToken, *writeNonce); err != nil {
+	if *certdir == "" {
+		panic("cert-dir is required")
+	}
+	if err := os.MkdirAll(*certdir, 0777); err != nil {
 		panic(err.Error())
 	}
 
-	if err := os.MkdirAll(*target, 0777); err != nil {
+	if *authdir != "" {
+		if err := os.MkdirAll(*authdir, 0777); err != nil {
+			panic(err.Error())
+		}
+	}
+
+	if *hostname == "" {
+		name, err := os.Hostname()
+		if err != nil {
+			panic(err.Error())
+		}
+		hostname = &name
+	}
+
+	if *ipsan == "" {
+		ip, err := externalIP()
+		if err != nil {
+			panic(err.Error())
+		}
+		ipsan = &ip
+	}
+
+	if *localhost {
+		ip := *ipsan + ",localhost"
+		ipsan = &ip
+	}
+
+	info, err := getAuthInfo(*authdir)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	if err := authenticate(vclient, VaultAuthStrategy(*vauth), info); err != nil {
+		panic(err.Error())
+	}
+
+	if err := writeAuthInfo(*authdir, info); err != nil {
 		panic(err.Error())
 	}
 
 	go func() {
 		path := fmt.Sprintf("%s/issue/%s", *pkibackend, *pkirole)
-		err := maintainCerts(vclient, path, *target)
+		err := maintainCerts(vclient, path, *certdir, *hostname, *ipsan)
 		if err != nil {
 			log.Fatal(err.Error())
 		}
@@ -63,19 +105,33 @@ func main() {
 	<-make(chan struct{})
 }
 
-func newVaultClient(flag string) (*vault.Client, error) {
-	vconfig := vault.DefaultConfig()
-	err := vconfig.ReadEnvironment()
-	if err != nil {
-		panic(err.Error())
-	}
-	if *vaddr != "" {
-		vconfig.Address = *vaddr
-	}
-	return vault.NewClient(vconfig)
+func getAuthInfo(dir string) (map[string]string, error) {
+	meta := map[string]string{}
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			return filepath.SkipDir
+		}
+		content, err := ioutil.ReadFile(dir)
+		if err != nil {
+			return err
+		}
+		meta[info.Name()] = string(content)
+		return nil
+	})
+	return meta, err
 }
 
-func authenticate(client *vault.Client, strategy VaultAuthStrategy, target string, writeToken, writeNonce bool) error {
+func writeAuthInfo(dir string, info map[string]string) error {
+	for key, val := range info {
+		err := ioutil.WriteFile(filepath.Join(dir, key), []byte(val), 0600)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func authenticate(client *vault.Client, strategy VaultAuthStrategy, info map[string]string) error {
 	switch strategy {
 	case AuthToken:
 		if client.Token() == "" {
@@ -92,33 +148,19 @@ func authenticate(client *vault.Client, strategy VaultAuthStrategy, target strin
 			"role":  os.Getenv("VAULT_AUTH_ROLE"),
 			"pkcs7": pkcs,
 		}
-		if writeNonce {
-			nonce, err := ioutil.ReadFile(path.Join(target, "nonce"))
-			if err != nil {
-				log.Printf("couldn't read nonce: %s", err.Error())
-			} else {
-				payload["nonce"] = string(nonce)
-			}
+		nonce, ok := info["nonce"]
+		if ok {
+			payload["nonce"] = string(nonce)
 		}
 		resp, err := client.Logical().Write("auth/aws-ec2/login", payload)
 		if err != nil {
 			return err
 		}
 
-		if writeNonce {
-			err := ioutil.WriteFile(path.Join(target, "nonce"), []byte(resp.Auth.Metadata["nonce"]), 0600)
-			if err != nil {
-				return err
-			}
-		}
+		info["token"] = resp.Auth.ClientToken
+		info["nonce"] = resp.Auth.Metadata["nonce"]
 
 		client.SetToken(resp.Auth.ClientToken)
-		if writeToken {
-			err := ioutil.WriteFile(path.Join(target, "file"), []byte(resp.Auth.ClientToken), 0600)
-			if err != nil {
-				return err
-			}
-		}
 		go func() {
 			half := (time.Duration(resp.Auth.LeaseDuration) * time.Second) / 2
 			for {
@@ -141,8 +183,20 @@ func authenticate(client *vault.Client, strategy VaultAuthStrategy, target strin
 	}
 }
 
-func maintainCerts(client *vault.Client, path string, dir string) error {
-	secret, err := getAndWriteCerts(client, path, dir)
+func newVaultClient(flag string) (*vault.Client, error) {
+	vconfig := vault.DefaultConfig()
+	err := vconfig.ReadEnvironment()
+	if err != nil {
+		panic(err.Error())
+	}
+	if *vaddr != "" {
+		vconfig.Address = *vaddr
+	}
+	return vault.NewClient(vconfig)
+}
+
+func maintainCerts(client *vault.Client, path string, dir string, hostname, ipsans string) error {
+	secret, err := getAndWriteCerts(client, path, dir, hostname, ipsans)
 	if err != nil {
 		return err
 	}
@@ -152,7 +206,7 @@ func maintainCerts(client *vault.Client, path string, dir string) error {
 		log.Printf("scheduling cert update after %s", half)
 		select {
 		case <-time.After(half):
-			secret, err := getAndWriteCerts(client, path, dir)
+			secret, err := getAndWriteCerts(client, path, dir, hostname, ipsans)
 			if err != nil {
 				return err
 			}
@@ -161,21 +215,12 @@ func maintainCerts(client *vault.Client, path string, dir string) error {
 	}
 }
 
-func getAndWriteCerts(client *vault.Client, path string, dir string) (*vault.Secret, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return nil, err
-	}
-
-	ip, err := externalIP()
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("using hostname %s, ip addr %s.", hostname, ip)
+func getAndWriteCerts(client *vault.Client, path string, dir string, hostname, ipsans string) (*vault.Secret, error) {
+	log.Printf("using hostname %s, ip addr %s.", hostname, ipsans)
 
 	secret, err := client.Logical().Write(path, map[string]interface{}{
 		"common_name": hostname,
-		"ip_sans":     ip,
+		"ip_sans":     ipsans,
 	})
 	if err != nil {
 		return nil, err
