@@ -34,8 +34,9 @@ var (
 type VaultAuthStrategy string
 
 const (
-	AuthToken  VaultAuthStrategy = "token"
-	AuthAWSEC2 VaultAuthStrategy = "aws-ec2"
+	AuthToken     VaultAuthStrategy = "token"
+	AuthTokenFile VaultAuthStrategy = "token-file"
+	AuthAWSEC2    VaultAuthStrategy = "aws-ec2"
 )
 
 func main() {
@@ -138,6 +139,13 @@ func authenticate(client *vault.Client, strategy VaultAuthStrategy, info map[str
 			return errors.New("VAULT_TOKEN not set")
 		}
 		return nil
+	case AuthTokenFile:
+		if token, ok := info["token"]; ok && token != "" {
+			client.SetToken(token)
+			return nil
+		} else {
+			return errors.New("token file not found")
+		}
 	case AuthAWSEC2:
 		identity, err := getAWSIdentityDocument()
 		if err != nil {
